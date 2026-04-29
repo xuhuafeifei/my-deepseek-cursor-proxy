@@ -21,7 +21,7 @@ from .config import (
     default_config_path,
     default_reasoning_content_path,
 )
-from .reasoning_store import ReasoningStore, session_key
+from .reasoning_store import ReasoningStore
 from .streaming import (
     CursorReasoningDisplayAdapter,
     StreamAccumulator,
@@ -131,9 +131,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": {"message": str(exc)}})
             return
 
-        if self.config.verbose:
-            log_json("cursor request body", payload)
-
         LOG.info("cursor request: %s", summarize_chat_payload(payload))
 
         prepared = prepare_upstream_request(
@@ -155,6 +152,21 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 ),
                 prepared.missing_reasoning_messages,
             )
+
+        RED = "\033[31m"
+        RESET = "\033[0m"
+        # Show most recent tool caches (last 5)
+        entries = [e for e in self.reasoning_store.list_entries() if e[0].startswith("tool:")]
+        recent = entries[-5:]
+        for i, (key, length, preview) in enumerate(recent, 1):
+            tool_id = key[len("tool:"):]
+            print(
+                f"{RED}  [tool] {tool_id[:16]}… → {preview}{RESET} ({length} chars)",
+                flush=True,
+            )
+        if entries:
+            print(f"{RED}  → {len(entries)} tool caches total{RESET}", flush=True)
+
         LOG.info(
             "deepseek send: %s patched=%s recovered=%s",
             compact_request_stats(prepared.payload),
@@ -230,14 +242,12 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     response,
                     prepared.original_model,
                     prepared.payload["messages"],
-                    prepared.session,
                 )
             else:
                 sent_response = self._proxy_regular_response(
                     response,
                     prepared.original_model,
                     prepared.payload["messages"],
-                    prepared.session,
                 )
             if not sent_response:
                 return
@@ -441,7 +451,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         response: Any,
         original_model: str,
         request_messages: list[dict[str, Any]],
-        session: str,
     ) -> bool:
         body = read_response_body(response)
         try:
@@ -449,8 +458,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 body,
                 original_model,
                 self.reasoning_store,
-                request_messages,
-                session,
             )
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             LOG.warning("failed to rewrite upstream JSON response: %s", exc)
@@ -479,7 +486,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         response: Any,
         original_model: str,
         request_messages: list[dict[str, Any]],
-        session: str,
     ) -> bool:
         sent_headers = self._send_response_headers(
             getattr(response, "status", 200),
@@ -500,7 +506,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             if self.config.cursor_display_reasoning
             else None
         )
-        scope = session_key(request_messages)
         finalized = False
         while True:
             try:
@@ -514,7 +519,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 line,
                 original_model,
                 accumulator,
-                scope,
                 display_adapter,
             )
             if not self._write_to_client(
@@ -527,7 +531,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if not finalized:
             if self.config.verbose:
                 log_json("model streaming assistant messages", accumulator.messages())
-            stored = accumulator.store_reasoning(self.reasoning_store, scope)
+            stored = accumulator.store_reasoning(self.reasoning_store)
             if stored:
                 LOG.info("stored %s streaming reasoning cache key(s)", stored)
         return True
@@ -537,7 +541,6 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         line: bytes,
         original_model: str,
         accumulator: StreamAccumulator,
-        scope: str,
         display_adapter: CursorReasoningDisplayAdapter | None,
     ) -> tuple[bytes, bool]:
         stripped = line.strip()
@@ -548,7 +551,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         if data == b"[DONE]":
             if self.config.verbose:
                 log_json("model streaming assistant messages", accumulator.messages())
-            stored = accumulator.store_reasoning(self.reasoning_store, scope)
+            stored = accumulator.store_reasoning(self.reasoning_store)
             if stored:
                 LOG.info("stored %s streaming reasoning cache key(s)", stored)
             print()  # newline after streaming
@@ -567,7 +570,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
 
         if isinstance(chunk, dict):
             accumulator.ingest_chunk(chunk)
-            stored = accumulator.store_ready_reasoning(self.reasoning_store, scope)
+            stored = accumulator.store_ready_reasoning(self.reasoning_store)
             if stored:
                 LOG.info("stored %s streaming reasoning cache key(s)", stored)
             log_usage(chunk.get("usage"))

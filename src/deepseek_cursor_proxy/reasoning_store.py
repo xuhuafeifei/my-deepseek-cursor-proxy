@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from pathlib import Path
 import sqlite3
 import threading
@@ -9,64 +7,8 @@ import time
 from typing import Any
 
 
-SESSION_MAX_THINKING = 5
-
-
-def _normalize_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
-    function = tool_call.get("function") or {}
-    if not isinstance(function, dict):
-        function = {}
-    arguments = function.get("arguments", "")
-    if not isinstance(arguments, str):
-        arguments = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
-    return {
-        "id": tool_call.get("id"),
-        "type": tool_call.get("type") or "function",
-        "function": {
-            "name": function.get("name") or "",
-            "arguments": arguments,
-        },
-    }
-
-
-def session_key(messages: list[dict[str, Any]], namespace: str = "") -> str:
-    first_user = next(
-        (m for m in messages if isinstance(m, dict) and m.get("role") == "user"),
-        None,
-    )
-    if first_user is None:
-        return ""
-    content = first_user.get("content") or ""
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                text = item.get("text") or item.get("content") or ""
-                parts.append(str(text))
-            else:
-                parts.append(str(item))
-        content = "\n".join(parts)
-    payload = {"namespace": namespace, "content": str(content)}
-    return hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
-def assistant_message_signature(message: dict[str, Any]) -> str:
-    tool_calls = [
-        _normalize_tool_call(tc)
-        for tc in (message.get("tool_calls") or [])
-        if isinstance(tc, dict)
-    ]
-    payload = {
-        "content": message.get("content") or "",
-        "tool_calls": tool_calls,
-    }
-    return hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+CACHE_MAX_ROWS = 100
+CACHE_MAX_AGE_SECONDS = 86400  # 24h
 
 
 class ReasoningStore:
@@ -75,11 +17,9 @@ class ReasoningStore:
         reasoning_content_path: str | Path,
         max_age_seconds: int | None = None,
         max_rows: int | None = None,
-        session_max_thinking: int = SESSION_MAX_THINKING,
     ) -> None:
-        self.max_age_seconds = max_age_seconds
-        self.max_rows = max_rows
-        self.session_max_thinking = session_max_thinking
+        self.max_age_seconds = max_age_seconds or CACHE_MAX_AGE_SECONDS
+        self.max_rows = max_rows or CACHE_MAX_ROWS
         if str(reasoning_content_path) == ":memory:":
             self.reasoning_content_path: str | Path = ":memory:"
         else:
@@ -97,26 +37,28 @@ class ReasoningStore:
             """
             CREATE TABLE IF NOT EXISTS reasoning_cache (
                 key TEXT PRIMARY KEY,
-                session TEXT NOT NULL DEFAULT '',
                 reasoning TEXT NOT NULL,
                 created_at REAL NOT NULL
             )
             """
         )
-        # Migrate old schema
+        # Migrate old schema if needed
         columns = [
             row[1]
             for row in self._conn.execute("PRAGMA table_info(reasoning_cache)")
         ]
-        if "session" not in columns:
+        if "session" in columns:
             self._conn.execute(
-                "ALTER TABLE reasoning_cache ADD COLUMN session TEXT DEFAULT ''"
+                "ALTER TABLE reasoning_cache DROP COLUMN session"
             )
         if "message_json" in columns:
             self._conn.execute(
                 "ALTER TABLE reasoning_cache DROP COLUMN message_json"
             )
-        self._conn.commit()
+        # Delete old-format keys from before tool_call_id refactor
+        self._conn.execute(
+            "DELETE FROM reasoning_cache WHERE key NOT LIKE 'tool:%'"
+        )
         self._conn.commit()
         self.prune()
 
@@ -124,48 +66,53 @@ class ReasoningStore:
         with self._lock:
             self._conn.close()
 
-    def put(self, key: str, session: str, reasoning: str) -> None:
-        if not isinstance(reasoning, str):
-            return
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO reasoning_cache(key, session, reasoning, created_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET
-                    reasoning = excluded.reasoning,
-                    created_at = excluded.created_at
-                """,
-                (key, session, reasoning, time.time()),
-            )
-            self._prune_locked()
-            self._conn.commit()
-
-    def get(self, key: str) -> str | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT reasoning FROM reasoning_cache WHERE key = ?",
-                (key,),
-            ).fetchone()
-        if row is None:
-            return None
-        return str(row[0])
-
-    def store_assistant_message(self, message: dict[str, Any], session: str) -> int:
+    def store_assistant_message(self, message: dict[str, Any]) -> int:
+        """Store reasoning_content keyed by the first tool_call_id in the message."""
         if message.get("role") != "assistant":
             return 0
         reasoning = message.get("reasoning_content")
         if not isinstance(reasoning, str):
             return 0
+        tool_calls = [
+            tc for tc in (message.get("tool_calls") or [])
+            if isinstance(tc, dict) and tc.get("id")
+        ]
+        if not tool_calls:
+            return 0
 
-        sig = assistant_message_signature(message)
-        key = f"session:{session}:message:{sig}"
-        self.put(key, session, reasoning)
+        key = f"tool:{tool_calls[0]['id']}"
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO reasoning_cache(key, reasoning, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    reasoning = excluded.reasoning,
+                    created_at = excluded.created_at
+                """,
+                (key, reasoning, time.time()),
+            )
+            self._prune_locked()
+            self._conn.commit()
         return 1
 
-    def lookup_for_message(self, message: dict[str, Any], session: str) -> str | None:
-        sig = assistant_message_signature(message)
-        return self.get(f"session:{session}:message:{sig}")
+    def lookup_for_message(self, message: dict[str, Any], session: str = "") -> str | None:
+        """Look up reasoning_content by the first tool_call_id in the message."""
+        tool_calls = [
+            tc for tc in (message.get("tool_calls") or [])
+            if isinstance(tc, dict) and tc.get("id")
+        ]
+        if not tool_calls:
+            return None
+        return self.get(f"tool:{tool_calls[0]['id']}")
+
+    def list_entries(self) -> list[tuple[str, int, str]]:
+        """Return (key, length, preview) for all cached entries."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key, reasoning FROM reasoning_cache ORDER BY created_at ASC"
+            ).fetchall()
+        return [(r[0], len(r[1]), r[1][:100]) for r in rows]
 
     def clear(self) -> int:
         with self._lock:
@@ -181,42 +128,33 @@ class ReasoningStore:
             self._conn.commit()
         return deleted
 
+    def get(self, key: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT reasoning FROM reasoning_cache WHERE key = ?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row[0])
+
     def _prune_locked(self) -> int:
         deleted = 0
-        if self.max_age_seconds is not None and self.max_age_seconds > 0:
-            cutoff = time.time() - self.max_age_seconds
-            cursor = self._conn.execute(
-                "DELETE FROM reasoning_cache WHERE created_at < ?",
-                (cutoff,),
-            )
-            deleted += cursor.rowcount if cursor.rowcount != -1 else 0
+        cutoff = time.time() - self.max_age_seconds
+        cursor = self._conn.execute(
+            "DELETE FROM reasoning_cache WHERE created_at < ?",
+            (cutoff,),
+        )
+        deleted += cursor.rowcount if cursor.rowcount != -1 else 0
 
-        if self.max_rows is not None and self.max_rows > 0:
-            cursor = self._conn.execute(
-                """
-                DELETE FROM reasoning_cache
-                WHERE key NOT IN (
-                    SELECT key FROM reasoning_cache ORDER BY created_at DESC LIMIT ?
-                )
-                """,
-                (self.max_rows,),
+        cursor = self._conn.execute(
+            """
+            DELETE FROM reasoning_cache
+            WHERE key NOT IN (
+                SELECT key FROM reasoning_cache ORDER BY created_at DESC LIMIT ?
             )
-            deleted += cursor.rowcount if cursor.rowcount != -1 else 0
-
-        # Per-session limit: keep latest N thinking entries per session
-        if self.session_max_thinking is not None and self.session_max_thinking > 0:
-            cursor = self._conn.execute(
-                """
-                DELETE FROM reasoning_cache
-                WHERE rowid NOT IN (
-                    SELECT rowid FROM (
-                        SELECT rowid,
-                               ROW_NUMBER() OVER (PARTITION BY session ORDER BY created_at DESC) AS rn
-                        FROM reasoning_cache
-                    ) WHERE rn <= ?
-                )
-                """,
-                (self.session_max_thinking,),
-            )
-            deleted += cursor.rowcount if cursor.rowcount != -1 else 0
+            """,
+            (self.max_rows,),
+        )
+        deleted += cursor.rowcount if cursor.rowcount != -1 else 0
         return deleted

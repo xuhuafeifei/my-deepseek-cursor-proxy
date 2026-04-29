@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import json
 import re
 from typing import Any
 
 from .config import ProxyConfig
-from .reasoning_store import ReasoningStore, session_key
+from .reasoning_store import ReasoningStore
 
 
 SUPPORTED_REQUEST_FIELDS = {
@@ -73,7 +72,6 @@ class PreparedRequest:
     payload: dict[str, Any]
     original_model: str
     upstream_model: str
-    session: str
     patched_reasoning_messages: int
     missing_reasoning_messages: int
     recovery_dropped_messages: int = 0
@@ -194,7 +192,6 @@ def normalize_message(
     message: Any,
     store: ReasoningStore | None,
     prior_messages: list[dict[str, Any]],
-    session: str,
     repair_reasoning: bool,
     keep_reasoning: bool,
 ) -> tuple[dict[str, Any], bool, bool]:
@@ -233,10 +230,7 @@ def normalize_message(
                     normalized, prior_messages
                 )
                 if needs_reasoning and store is not None:
-                    restored = store.lookup_for_message(
-                        normalized,
-                        session_key(prior_messages) if session else "",
-                    )
+                    restored = store.lookup_for_message(normalized)
                     if restored is not None:
                         normalized["reasoning_content"] = restored
                         patched = True
@@ -253,7 +247,6 @@ def normalize_message(
 def normalize_messages(
     messages: Any,
     store: ReasoningStore | None,
-    session: str,
     repair_reasoning: bool,
     keep_reasoning: bool,
 ) -> tuple[list[dict[str, Any]], int, list[int]]:
@@ -262,18 +255,21 @@ def normalize_messages(
     normalized_messages: list[dict[str, Any]] = []
     patched_count = 0
     missing_indexes: list[int] = []
+    reasoning_counter = 0
     for message in messages:
         normalized, patched, missing = normalize_message(
             message,
             store,
             normalized_messages,
-            session,
             repair_reasoning,
             keep_reasoning,
         )
         normalized_messages.append(normalized)
         if patched:
             patched_count += 1
+            reasoning_counter += 1
+            reasoning = normalized.get("reasoning_content", "")
+            print(f"\033[31m  [{reasoning_counter}] {reasoning[:100]}\033[0m", flush=True)
         if missing:
             missing_indexes.append(len(normalized_messages) - 1)
     return normalized_messages, patched_count, missing_indexes
@@ -383,11 +379,9 @@ def prepare_upstream_request(
             prepared.get("reasoning_effort") or config.reasoning_effort
         )
 
-    session = session_key(payload.get("messages"))
     messages, patched_count, missing_indexes = normalize_messages(
         payload.get("messages"),
         store,
-        session,
         repair_reasoning=thinking_enabled,
         keep_reasoning=not thinking_disabled,
     )
@@ -403,7 +397,6 @@ def prepare_upstream_request(
         messages, patched_count, missing_indexes = normalize_messages(
             recovered_messages,
             store,
-            session,
             repair_reasoning=thinking_enabled,
             keep_reasoning=not thinking_disabled,
         )
@@ -413,7 +406,6 @@ def prepare_upstream_request(
         payload=prepared,
         original_model=original_model,
         upstream_model=upstream_model,
-        session=session,
         patched_reasoning_messages=patched_count,
         missing_reasoning_messages=len(missing_indexes),
         recovery_dropped_messages=recovery_dropped_messages,
@@ -424,8 +416,6 @@ def prepare_upstream_request(
 def record_response_reasoning(
     response_payload: dict[str, Any],
     store: ReasoningStore | None,
-    request_messages: list[dict[str, Any]],
-    session: str = "",
 ) -> int:
     if store is None:
         return 0
@@ -433,13 +423,12 @@ def record_response_reasoning(
     choices = response_payload.get("choices")
     if not isinstance(choices, list):
         return stored
-    scope = session_key(request_messages) if not session else session
     for choice in choices:
         if not isinstance(choice, dict):
             continue
         message = choice.get("message")
         if isinstance(message, dict):
-            stored += store.store_assistant_message(message, scope)
+            stored += store.store_assistant_message(message)
     return stored
 
 
@@ -447,14 +436,10 @@ def rewrite_response_body(
     body: bytes,
     original_model: str,
     store: ReasoningStore | None,
-    request_messages: list[dict[str, Any]],
-    session: str = "",
 ) -> bytes:
     response_payload = json.loads(body.decode("utf-8"))
     if isinstance(response_payload, dict):
-        record_response_reasoning(
-            response_payload, store, request_messages, session
-        )
+        record_response_reasoning(response_payload, store)
         if "model" in response_payload:
             response_payload["model"] = original_model
     return json.dumps(

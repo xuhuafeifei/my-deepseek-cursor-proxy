@@ -70,26 +70,26 @@ class StreamAccumulator:
 
             self._merge_tool_call_deltas(choice, delta.get("tool_calls"))
 
-    def store_reasoning(self, store: ReasoningStore, scope: str) -> int:
+    def store_reasoning(self, store: ReasoningStore) -> int:
         stored = 0
         for index, choice in self.choices.items():
-            stored += self._store_choice(index, choice, store, scope)
+            stored += self._store_choice(index, choice, store)
         return stored
 
-    def store_finished_reasoning(self, store: ReasoningStore, scope: str) -> int:
+    def store_finished_reasoning(self, store: ReasoningStore) -> int:
         stored = 0
         for index, choice in self.choices.items():
             if choice.finish_reason is not None:
-                stored += self._store_choice(index, choice, store, scope, "final")
+                stored += self._store_choice(index, choice, store, "final")
         return stored
 
-    def store_ready_reasoning(self, store: ReasoningStore, scope: str) -> int:
+    def store_ready_reasoning(self, store: ReasoningStore) -> int:
         stored = 0
         for index, choice in self.choices.items():
             if choice.finish_reason is not None:
-                stored += self._store_choice(index, choice, store, scope, "final")
+                stored += self._store_choice(index, choice, store, "final")
             elif self._has_identified_tool_calls(choice):
-                stored += self._store_choice(index, choice, store, scope, "tool_call")
+                stored += self._store_choice(index, choice, store, "tool_call")
         return stored
 
     def messages(self) -> list[dict[str, Any]]:
@@ -139,14 +139,13 @@ class StreamAccumulator:
         index: int,
         choice: StreamingChoice,
         store: ReasoningStore,
-        scope: str,
         stage: str = "final",
     ) -> int:
         stage_rank = {"tool_call": 1, "final": 2}
         previous_stage = self._stored_choices.get(index)
         if stage_rank.get(previous_stage or "", 0) >= stage_rank.get(stage, 0):
             return 0
-        stored = store.store_assistant_message(choice.to_message(), scope)
+        stored = store.store_assistant_message(choice.to_message())
         if stored:
             self._stored_choices[index] = stage
         return stored
