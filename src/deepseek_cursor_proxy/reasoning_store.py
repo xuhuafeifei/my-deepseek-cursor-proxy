@@ -9,16 +9,17 @@ import time
 from typing import Any
 
 
-def normalize_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
+SESSION_MAX_THINKING = 5
+
+
+def _normalize_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
     function = tool_call.get("function") or {}
     if not isinstance(function, dict):
         function = {}
-
     arguments = function.get("arguments", "")
     if not isinstance(arguments, str):
         arguments = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
-
-    normalized: dict[str, Any] = {
+    return {
         "id": tool_call.get("id"),
         "type": tool_call.get("type") or "function",
         "function": {
@@ -26,65 +27,46 @@ def normalize_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
             "arguments": arguments,
         },
     }
-    return normalized
 
 
-def tool_call_signature(tool_call: dict[str, Any]) -> str:
-    normalized = normalize_tool_call(tool_call)
-    normalized.pop("id", None)
-    canonical = json.dumps(
-        normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+def session_key(messages: list[dict[str, Any]], namespace: str = "") -> str:
+    first_user = next(
+        (m for m in messages if isinstance(m, dict) and m.get("role") == "user"),
+        None,
     )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if first_user is None:
+        return ""
+    content = first_user.get("content") or ""
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content") or ""
+                parts.append(str(text))
+            else:
+                parts.append(str(item))
+        content = "\n".join(parts)
+    payload = {"namespace": namespace, "content": str(content)}
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
-def tool_call_ids(message: dict[str, Any]) -> list[str]:
-    ids: list[str] = []
-    for tool_call in message.get("tool_calls") or []:
-        if isinstance(tool_call, dict) and tool_call.get("id"):
-            ids.append(str(tool_call["id"]))
-    return ids
-
-
-def message_signature(message: dict[str, Any]) -> str:
+def assistant_message_signature(message: dict[str, Any]) -> str:
     tool_calls = [
-        normalize_tool_call(tool_call)
-        for tool_call in (message.get("tool_calls") or [])
-        if isinstance(tool_call, dict)
+        _normalize_tool_call(tc)
+        for tc in (message.get("tool_calls") or [])
+        if isinstance(tc, dict)
     ]
     payload = {
         "content": message.get("content") or "",
         "tool_calls": tool_calls,
     }
-    canonical = json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def canonical_scope_message(message: dict[str, Any]) -> dict[str, Any]:
-    canonical: dict[str, Any] = {"role": message.get("role")}
-    for key in ("content", "name", "tool_call_id", "prefix"):
-        if key in message:
-            canonical[key] = message[key]
-    if message.get("tool_calls"):
-        canonical["tool_calls"] = [
-            normalize_tool_call(tool_call)
-            for tool_call in message.get("tool_calls") or []
-            if isinstance(tool_call, dict)
-        ]
-    return canonical
-
-
-def conversation_scope(messages: list[dict[str, Any]], namespace: str = "") -> str:
-    scope_messages = [canonical_scope_message(message) for message in messages]
-    payload: Any = scope_messages
-    if namespace:
-        payload = {"namespace": namespace, "messages": scope_messages}
-    canonical = json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 class ReasoningStore:
@@ -93,9 +75,11 @@ class ReasoningStore:
         reasoning_content_path: str | Path,
         max_age_seconds: int | None = None,
         max_rows: int | None = None,
+        session_max_thinking: int = SESSION_MAX_THINKING,
     ) -> None:
         self.max_age_seconds = max_age_seconds
         self.max_rows = max_rows
+        self.session_max_thinking = session_max_thinking
         if str(reasoning_content_path) == ":memory:":
             self.reasoning_content_path: str | Path = ":memory:"
         else:
@@ -113,12 +97,26 @@ class ReasoningStore:
             """
             CREATE TABLE IF NOT EXISTS reasoning_cache (
                 key TEXT PRIMARY KEY,
+                session TEXT NOT NULL DEFAULT '',
                 reasoning TEXT NOT NULL,
-                message_json TEXT NOT NULL,
                 created_at REAL NOT NULL
             )
             """
         )
+        # Migrate old schema
+        columns = [
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(reasoning_cache)")
+        ]
+        if "session" not in columns:
+            self._conn.execute(
+                "ALTER TABLE reasoning_cache ADD COLUMN session TEXT DEFAULT ''"
+            )
+        if "message_json" in columns:
+            self._conn.execute(
+                "ALTER TABLE reasoning_cache DROP COLUMN message_json"
+            )
+        self._conn.commit()
         self._conn.commit()
         self.prune()
 
@@ -126,21 +124,19 @@ class ReasoningStore:
         with self._lock:
             self._conn.close()
 
-    def put(self, key: str, reasoning: str, message: dict[str, Any]) -> None:
+    def put(self, key: str, session: str, reasoning: str) -> None:
         if not isinstance(reasoning, str):
             return
-        message_json = json.dumps(message, ensure_ascii=False, sort_keys=True)
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO reasoning_cache(key, reasoning, message_json, created_at)
+                INSERT INTO reasoning_cache(key, session, reasoning, created_at)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(key) DO UPDATE SET
                     reasoning = excluded.reasoning,
-                    message_json = excluded.message_json,
                     created_at = excluded.created_at
                 """,
-                (key, reasoning, message_json, time.time()),
+                (key, session, reasoning, time.time()),
             )
             self._prune_locked()
             self._conn.commit()
@@ -155,54 +151,21 @@ class ReasoningStore:
             return None
         return str(row[0])
 
-    def store_assistant_message(self, message: dict[str, Any], scope: str) -> int:
+    def store_assistant_message(self, message: dict[str, Any], session: str) -> int:
         if message.get("role") != "assistant":
             return 0
         reasoning = message.get("reasoning_content")
         if not isinstance(reasoning, str):
             return 0
 
-        keys = [f"scope:{scope}:signature:{message_signature(message)}"]
-        keys.extend(
-            f"scope:{scope}:tool_call:{tool_call_id}"
-            for tool_call_id in tool_call_ids(message)
-        )
-        keys.extend(
-            f"scope:{scope}:tool_call_signature:{tool_call_signature(tool_call)}"
-            for tool_call in (message.get("tool_calls") or [])
-            if isinstance(tool_call, dict)
-        )
-        # Global keys (no scope) for cross-turn lookup
-        keys.extend(
-            f"tool_call:{tool_call_id}"
-            for tool_call_id in tool_call_ids(message)
-        )
-        keys.extend(
-            f"tool_call_signature:{tool_call_signature(tool_call)}"
-            for tool_call in (message.get("tool_calls") or [])
-            if isinstance(tool_call, dict)
-        )
-        for key in keys:
-            self.put(key, reasoning, message)
-        return len(keys)
+        sig = assistant_message_signature(message)
+        key = f"session:{session}:message:{sig}"
+        self.put(key, session, reasoning)
+        return 1
 
-    def lookup_for_message(self, message: dict[str, Any], scope: str) -> str | None:
-        reasoning = self.get(f"scope:{scope}:signature:{message_signature(message)}")
-        if reasoning is not None:
-            return reasoning
-        for tool_call_id in tool_call_ids(message):
-            reasoning = self.get(f"scope:{scope}:tool_call:{tool_call_id}")
-            if reasoning is not None:
-                return reasoning
-        for tool_call in message.get("tool_calls") or []:
-            if not isinstance(tool_call, dict):
-                continue
-            reasoning = self.get(
-                f"scope:{scope}:tool_call_signature:{tool_call_signature(tool_call)}"
-            )
-            if reasoning is not None:
-                return reasoning
-        return None
+    def lookup_for_message(self, message: dict[str, Any], session: str) -> str | None:
+        sig = assistant_message_signature(message)
+        return self.get(f"session:{session}:message:{sig}")
 
     def clear(self) -> int:
         with self._lock:
@@ -233,13 +196,27 @@ class ReasoningStore:
                 """
                 DELETE FROM reasoning_cache
                 WHERE key NOT IN (
-                    SELECT key
-                    FROM reasoning_cache
-                    ORDER BY created_at DESC
-                    LIMIT ?
+                    SELECT key FROM reasoning_cache ORDER BY created_at DESC LIMIT ?
                 )
                 """,
                 (self.max_rows,),
+            )
+            deleted += cursor.rowcount if cursor.rowcount != -1 else 0
+
+        # Per-session limit: keep latest N thinking entries per session
+        if self.session_max_thinking is not None and self.session_max_thinking > 0:
+            cursor = self._conn.execute(
+                """
+                DELETE FROM reasoning_cache
+                WHERE rowid NOT IN (
+                    SELECT rowid FROM (
+                        SELECT rowid,
+                               ROW_NUMBER() OVER (PARTITION BY session ORDER BY created_at DESC) AS rn
+                        FROM reasoning_cache
+                    ) WHERE rn <= ?
+                )
+                """,
+                (self.session_max_thinking,),
             )
             deleted += cursor.rowcount if cursor.rowcount != -1 else 0
         return deleted

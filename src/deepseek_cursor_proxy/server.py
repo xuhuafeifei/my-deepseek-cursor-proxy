@@ -21,7 +21,7 @@ from .config import (
     default_config_path,
     default_reasoning_content_path,
 )
-from .reasoning_store import ReasoningStore, conversation_scope
+from .reasoning_store import ReasoningStore, session_key
 from .streaming import (
     CursorReasoningDisplayAdapter,
     StreamAccumulator,
@@ -230,14 +230,14 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                     response,
                     prepared.original_model,
                     prepared.payload["messages"],
-                    prepared.cache_namespace,
+                    prepared.session,
                 )
             else:
                 sent_response = self._proxy_regular_response(
                     response,
                     prepared.original_model,
                     prepared.payload["messages"],
-                    prepared.cache_namespace,
+                    prepared.session,
                 )
             if not sent_response:
                 return
@@ -441,7 +441,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         response: Any,
         original_model: str,
         request_messages: list[dict[str, Any]],
-        cache_namespace: str,
+        session: str,
     ) -> bool:
         body = read_response_body(response)
         try:
@@ -450,7 +450,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
                 original_model,
                 self.reasoning_store,
                 request_messages,
-                cache_namespace,
+                session,
             )
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             LOG.warning("failed to rewrite upstream JSON response: %s", exc)
@@ -479,7 +479,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
         response: Any,
         original_model: str,
         request_messages: list[dict[str, Any]],
-        cache_namespace: str,
+        session: str,
     ) -> bool:
         sent_headers = self._send_response_headers(
             getattr(response, "status", 200),
@@ -500,7 +500,7 @@ class DeepSeekProxyHandler(BaseHTTPRequestHandler):
             if self.config.cursor_display_reasoning
             else None
         )
-        scope = conversation_scope(request_messages, cache_namespace)
+        scope = session_key(request_messages)
         finalized = False
         while True:
             try:

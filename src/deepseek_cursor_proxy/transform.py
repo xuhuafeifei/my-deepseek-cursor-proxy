@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 from .config import ProxyConfig
-from .reasoning_store import ReasoningStore, conversation_scope
+from .reasoning_store import ReasoningStore, session_key
 
 
 SUPPORTED_REQUEST_FIELDS = {
@@ -73,7 +73,7 @@ class PreparedRequest:
     payload: dict[str, Any]
     original_model: str
     upstream_model: str
-    cache_namespace: str
+    session: str
     patched_reasoning_messages: int
     missing_reasoning_messages: int
     recovery_dropped_messages: int = 0
@@ -194,7 +194,7 @@ def normalize_message(
     message: Any,
     store: ReasoningStore | None,
     prior_messages: list[dict[str, Any]],
-    cache_namespace: str,
+    session: str,
     repair_reasoning: bool,
     keep_reasoning: bool,
 ) -> tuple[dict[str, Any], bool, bool]:
@@ -235,7 +235,7 @@ def normalize_message(
                 if needs_reasoning and store is not None:
                     restored = store.lookup_for_message(
                         normalized,
-                        conversation_scope(prior_messages, cache_namespace),
+                        session_key(prior_messages) if session else "",
                     )
                     if restored is not None:
                         normalized["reasoning_content"] = restored
@@ -253,7 +253,7 @@ def normalize_message(
 def normalize_messages(
     messages: Any,
     store: ReasoningStore | None,
-    cache_namespace: str,
+    session: str,
     repair_reasoning: bool,
     keep_reasoning: bool,
 ) -> tuple[list[dict[str, Any]], int, list[int]]:
@@ -267,7 +267,7 @@ def normalize_messages(
             message,
             store,
             normalized_messages,
-            cache_namespace,
+            session,
             repair_reasoning,
             keep_reasoning,
         )
@@ -327,29 +327,6 @@ def upstream_model_for(original_model: str, config: ProxyConfig) -> str:
     return config.upstream_model
 
 
-def reasoning_cache_namespace(
-    config: ProxyConfig,
-    upstream_model: str,
-    thinking: Any,
-    reasoning_effort: Any,
-    authorization: str | None = None,
-) -> str:
-    auth_hash = ""
-    if authorization:
-        auth_hash = hashlib.sha256(authorization.encode("utf-8")).hexdigest()
-    payload = {
-        "base_url": config.upstream_base_url,
-        "model": upstream_model,
-        "thinking": thinking,
-        "reasoning_effort": reasoning_effort,
-        "authorization_hash": auth_hash,
-    }
-    canonical = json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
 def prepare_upstream_request(
     payload: dict[str, Any],
     config: ProxyConfig,
@@ -406,17 +383,11 @@ def prepare_upstream_request(
             prepared.get("reasoning_effort") or config.reasoning_effort
         )
 
-    cache_namespace = reasoning_cache_namespace(
-        config,
-        upstream_model,
-        prepared.get("thinking"),
-        prepared.get("reasoning_effort"),
-        authorization,
-    )
+    session = session_key(payload.get("messages"))
     messages, patched_count, missing_indexes = normalize_messages(
         payload.get("messages"),
         store,
-        cache_namespace,
+        session,
         repair_reasoning=thinking_enabled,
         keep_reasoning=not thinking_disabled,
     )
@@ -432,7 +403,7 @@ def prepare_upstream_request(
         messages, patched_count, missing_indexes = normalize_messages(
             recovered_messages,
             store,
-            cache_namespace,
+            session,
             repair_reasoning=thinking_enabled,
             keep_reasoning=not thinking_disabled,
         )
@@ -442,7 +413,7 @@ def prepare_upstream_request(
         payload=prepared,
         original_model=original_model,
         upstream_model=upstream_model,
-        cache_namespace=cache_namespace,
+        session=session,
         patched_reasoning_messages=patched_count,
         missing_reasoning_messages=len(missing_indexes),
         recovery_dropped_messages=recovery_dropped_messages,
@@ -454,7 +425,7 @@ def record_response_reasoning(
     response_payload: dict[str, Any],
     store: ReasoningStore | None,
     request_messages: list[dict[str, Any]],
-    cache_namespace: str = "",
+    session: str = "",
 ) -> int:
     if store is None:
         return 0
@@ -462,7 +433,7 @@ def record_response_reasoning(
     choices = response_payload.get("choices")
     if not isinstance(choices, list):
         return stored
-    scope = conversation_scope(request_messages, cache_namespace)
+    scope = session_key(request_messages) if not session else session
     for choice in choices:
         if not isinstance(choice, dict):
             continue
@@ -477,12 +448,12 @@ def rewrite_response_body(
     original_model: str,
     store: ReasoningStore | None,
     request_messages: list[dict[str, Any]],
-    cache_namespace: str = "",
+    session: str = "",
 ) -> bytes:
     response_payload = json.loads(body.decode("utf-8"))
     if isinstance(response_payload, dict):
         record_response_reasoning(
-            response_payload, store, request_messages, cache_namespace
+            response_payload, store, request_messages, session
         )
         if "model" in response_payload:
             response_payload["model"] = original_model
