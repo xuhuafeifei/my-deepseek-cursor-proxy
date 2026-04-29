@@ -76,9 +76,8 @@ class PreparedRequest:
     cache_namespace: str
     patched_reasoning_messages: int
     missing_reasoning_messages: int
-    recovered_reasoning_messages: int = 0
     recovery_dropped_messages: int = 0
-    recovery_notice: str | None = None
+    recovered_reasoning_messages: int = 0
 
 
 def normalize_reasoning_effort(value: Any) -> str:
@@ -280,6 +279,33 @@ def normalize_messages(
     return normalized_messages, patched_count, missing_indexes
 
 
+def leading_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    leading: list[dict[str, Any]] = []
+    for message in messages:
+        if message.get("role") == "system":
+            leading.append(message)
+            continue
+        break
+    return leading
+
+
+def recover_messages_from_missing_reasoning(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    last_user_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if messages[index].get("role") == "user"
+        ),
+        -1,
+    )
+    if last_user_index == -1:
+        return messages
+    leading = leading_system_messages(messages)
+    return [*leading, messages[last_user_index]]
+
+
 def assistant_needs_reasoning_for_tool_context(
     message: dict[str, Any],
     prior_messages: list[dict[str, Any]],
@@ -394,6 +420,22 @@ def prepare_upstream_request(
         repair_reasoning=thinking_enabled,
         keep_reasoning=not thinking_disabled,
     )
+    recovered_count = 0
+    recovery_dropped_messages = 0
+    while missing_indexes and thinking_enabled:
+        recovered_messages = recover_messages_from_missing_reasoning(messages)
+        dropped = len(messages) - len(recovered_messages)
+        if dropped <= 0:
+            break
+        recovered_count += len(missing_indexes)
+        recovery_dropped_messages += dropped
+        messages, patched_count, missing_indexes = normalize_messages(
+            recovered_messages,
+            store,
+            cache_namespace,
+            repair_reasoning=thinking_enabled,
+            keep_reasoning=not thinking_disabled,
+        )
     prepared["messages"] = messages
 
     return PreparedRequest(
@@ -403,9 +445,8 @@ def prepare_upstream_request(
         cache_namespace=cache_namespace,
         patched_reasoning_messages=patched_count,
         missing_reasoning_messages=len(missing_indexes),
-        recovery_dropped_messages=0,
-        recovered_reasoning_messages=0,
-        recovery_notice=None,
+        recovery_dropped_messages=recovery_dropped_messages,
+        recovered_reasoning_messages=recovered_count,
     )
 
 
@@ -437,12 +478,9 @@ def rewrite_response_body(
     store: ReasoningStore | None,
     request_messages: list[dict[str, Any]],
     cache_namespace: str = "",
-    content_prefix: str | None = None,
 ) -> bytes:
     response_payload = json.loads(body.decode("utf-8"))
     if isinstance(response_payload, dict):
-        if content_prefix:
-            prefix_response_content(response_payload, content_prefix)
         record_response_reasoning(
             response_payload, store, request_messages, cache_namespace
         )
@@ -451,19 +489,3 @@ def rewrite_response_body(
     return json.dumps(
         response_payload, ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8")
-
-
-def prefix_response_content(response_payload: dict[str, Any], prefix: str) -> bool:
-    choices = response_payload.get("choices")
-    if not isinstance(choices, list):
-        return False
-    for choice in choices:
-        if not isinstance(choice, dict):
-            continue
-        message = choice.get("message")
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        message["content"] = prefix + (content if isinstance(content, str) else "")
-        return True
-    return False

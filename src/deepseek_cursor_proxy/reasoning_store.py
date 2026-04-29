@@ -172,6 +172,16 @@ class ReasoningStore:
             for tool_call in (message.get("tool_calls") or [])
             if isinstance(tool_call, dict)
         )
+        # Global keys (no scope) for cross-turn lookup
+        keys.extend(
+            f"tool_call:{tool_call_id}"
+            for tool_call_id in tool_call_ids(message)
+        )
+        keys.extend(
+            f"tool_call_signature:{tool_call_signature(tool_call)}"
+            for tool_call in (message.get("tool_calls") or [])
+            if isinstance(tool_call, dict)
+        )
         for key in keys:
             self.put(key, reasoning, message)
         return len(keys)
